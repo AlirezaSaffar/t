@@ -1,0 +1,36 @@
+KAIST Multispectral Pedestrian Dataset:
+https://github.com/CalayZhou/Multispectral-Pedestrian-Detection-Resource
+این دیتاست رو مجددا امتحان کردم،
+ دانلودش از طریق فایل های sh انجام میشه و دو تا ورژن sh داره، یکی مستقیم و دیگری هم از one drive. مورد اول که ارور سرور 503 میده، مورد دومی هم صفحه one drive اش در دسترس نیست و This item might not exist or is no longer available میده.
+لینک ها رو مستقل از فایل sh و به شکل مستقیم هم بررسی کردم، باز هم همان موارد پیش  اومد. (با و بدون vpn)
+
+دیتاست 
+multi-spectral stereo (MS2) outdoor dataset:
+https://sites.google.com/view/multi-spectral-stereo-dataset
+هم نیاز به ایمیل داشت (البته ایمیل رو verify نکرد، به گمانم دلیل ایمیل خواستنش صرفا برای جلوگیری از اسپم بود) و لینکهای دانلود رو از طریق ایمیل گرفتم. دیتاست فوق العاده ای هستش و حدس میزنم حجمش بین 200 الی 500 گیگ باشه و دانلودش نکردم.
+همچنین به گفته خود نویسنده های مقالات قراره یک نسخه MS3 هم در طی امسال عرضه بشه.
+این هم لینک های دانلود:
+https://drive.google.com/file/d/1SlbGWKLHN8sfECD0Nqyytt6K1z7B9gxV/view?usp=sharing
+
+https://drive.google.com/file/d/1SmSkhawnBib3tDd-MyxYwv0TYAHwCTYb/view?usp=sharing
+
+https://drive.google.com/file/d/1SpFfLXSr5hhiykk1xaL_Rn9iZKFKouFc/view?usp=sharing
+(البته مستقیم نیستند، بلکه ساختار فایل sh هستن که البته از داخل همون فایل sh میشه به لینک ها دسترسی داشت.)
+
+
+این دیتاست هم دانلود کردم:
+RGBT234
+https://sites.google.com/view/ahutracking001/
+حجم نزدیک به 7.5 گیگ. دیتاست بسیار خوبی هستش و توی 234 موقعیت مختلف فیلمبرداری (؟) شده و از هر موقعیت نزدیک به 300 تا سمپل گرفته شده (با اختلاف زمانی های خیلی کم) و براشون pair های thermal هم گذاشته شده. حتی اگر هر 234 موقعیت، 10 تا عکس هم برداریم باز هم نزدیک به 2400 تا pair باکیفیت رنگی-حرارتی خواهیم داشت.
+
+
+دیتاست 
+Urban Hyperspectral Image:
+https://paperswithcode.com/dataset/urban-hyperspectral-image
+این دیتاست رو من بررسی کردم و با فایلی به حجم 20وخرده ای مگ رسیدم. (احتمالا کل دیتاست رو شامل نمیشده و تست بوده). داخل فایل، به شکل .hdr و .wvl بودن که 162 طول موج از 400 تا 2500 نانومتر رو شامل میشد (با توجه به توضیحات خود دیتاست). 
+به این ترتیب، در نهایت میشه به SWIR دسترسی داشت و نه ترمال و شاید این دیتاست گزینه مناسبی نباشه چون طیف مد نظر ما رو پوشش نمیده.
+
+
+این دیتاستها هم به نظرم جالب اومد ولی هنوز بررسی نکردم:
+https://bupt-ai-cz.github.io/LLVIP/
+https://paperswithcode.com/dataset/dronevehicle
