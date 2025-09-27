@@ -34,3 +34,21 @@ https://paperswithcode.com/dataset/urban-hyperspectral-image
 این دیتاستها هم به نظرم جالب اومد ولی هنوز بررسی نکردم:
 https://bupt-ai-cz.github.io/LLVIP/
 https://paperswithcode.com/dataset/dronevehicle
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+https://drive.google.com/drive/folders/1hprzDQNwhFIQbLEa7p9WQUMMJHnYjdxk
