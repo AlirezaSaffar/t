@@ -1,0 +1,400 @@
+"""
+profile_images.py
+
+Usage:
+    from profile_images import profile_dataset_images, print_report, save_report_json
+
+    root = "_2021-08-13-16-08-46"
+    report = profile_dataset_images(root,
+                                    modalities=("rgb","thr"),
+                                    views=("img_left","img_right"),
+                                    sample_limit=200,
+                                    compute_histograms=True,
+                                    hist_bins=256)
+    print_report(report)
+    save_report_json(report, "profile_report.json")
+"""
+
+import os
+import json
+from collections import defaultdict, Counter
+import numpy as np
+from PIL import Image
+import imageio
+import cv2
+import matplotlib.pyplot as plt
+
+# ------------------ Helpers ------------------
+
+def list_image_files(folder, exts=(".png", ".jpg", ".jpeg", ".tif", ".tiff")):
+    files = [f for f in sorted(os.listdir(folder)) if f.lower().endswith(exts)]
+    return files
+
+def load_image(path, as_gray=False):
+    """
+    Returns numpy array image.
+    Uses imageio/PIL fallback.
+    """
+    try:
+        im = imageio.imread(path)
+    except Exception:
+        im = np.array(Image.open(path))
+    # convert palette to RGB if needed
+    if im.dtype == np.uint8 or im.dtype == np.uint16 or im.dtype == np.float32:
+        pass
+    else:
+        im = im.astype(np.float32)
+    if as_gray:
+        if im.ndim == 3:
+            im = cv2.cvtColor(im, cv2.COLOR_RGB2GRAY)
+        elif im.ndim == 2:
+            pass
+    return im
+
+def dtype_bit_depth(dtype):
+    # approximate readable bit depth from numpy dtype
+    if np.issubdtype(dtype, np.uint8):
+        return 8
+    if np.issubdtype(dtype, np.uint16):
+        return 16
+    if np.issubdtype(dtype, np.float32) or np.issubdtype(dtype, np.float64):
+        return "float32/64"
+    return str(dtype)
+
+def file_metadata(path):
+    im = load_image(path, as_gray=False)
+    shape = im.shape
+    channels = 1 if im.ndim == 2 else shape[2]
+    h = shape[0]
+    w = shape[1]
+    bit = dtype_bit_depth(im.dtype)
+    mins = float(np.nanmin(im))
+    maxs = float(np.nanmax(im))
+    mean = float(np.nanmean(im))
+    std = float(np.nanstd(im))
+    return {
+        "file": path,
+        "width": int(w),
+        "height": int(h),
+        "channels": int(channels),
+        "dtype": str(im.dtype),
+        "bit_depth": bit,
+        "min": mins,
+        "max": maxs,
+        "mean": mean,
+        "std": std
+    }
+
+def is_lwir_candidate(meta):
+    """
+    Heuristic to decide if a single-channel image is likely LWIR:
+    - single channel
+    - dtype float or max > 255 or bit_depth > 8
+    """
+    if meta["channels"] == 1:
+        if "float" in meta["dtype"]:
+            return True
+        if isinstance(meta["bit_depth"], int) and meta["bit_depth"] >= 16:
+            return True
+        if meta["max"] > 255:
+            return True
+    return False
+
+def dead_and_noise_metrics(im):
+    """
+    Compute some quality metrics:
+    - dead pixels: values exactly 0 or exactly max (depending on dtype)
+    - nan count
+    - fraction of extreme values
+    """
+    arr = np.array(im, copy=False)
+    nan_count = int(np.sum(np.isnan(arr)))
+    if np.issubdtype(arr.dtype, np.floating):
+        # use tolerance for "dead" near zero
+        dead_count = int(np.sum(np.isclose(arr, 0.0)))
+    else:
+        dead_count = int(np.sum(arr == 0))
+    max_val = np.nanmax(arr)
+    max_count = int(np.sum(arr == max_val))
+    total = arr.size
+    return {
+        "nan_count": nan_count,
+        "dead_count": dead_count,
+        "max_count": max_count,
+        "dead_fraction": dead_count/total if total>0 else None,
+        "max_fraction": max_count/total if total>0 else None
+    }
+
+def histogram_for_image(im, bins=256, range=None):
+    arr = np.array(im).ravel()
+    arr = arr[~np.isnan(arr)]
+    if arr.size == 0:
+        return None
+    if range is None:
+        amin = float(np.min(arr))
+        amax = float(np.max(arr))
+        if amin == amax:
+            # tiny range
+            amax = amin + 1.0
+        range = (amin, amax)
+    hist, bin_edges = np.histogram(arr, bins=bins, range=range)
+    return {"hist": hist.tolist(), "bin_edges": bin_edges.tolist(), "range": range}
+
+def phase_correlation_offset(img1, img2):
+    """
+    Estimate integer shift (dx, dy) between two images using phase correlation.
+    img1, img2 should be single-channel float32.
+    Returns (dx, dy, response) where response is the peak strength.
+    """
+    # convert to float32 and window to reduce edge effect
+    a = np.array(img1, dtype=np.float32)
+    b = np.array(img2, dtype=np.float32)
+    if a.shape != b.shape:
+        # resize b to a minimally (or return None)
+        h = min(a.shape[0], b.shape[0])
+        w = min(a.shape[1], b.shape[1])
+        a = a[:h, :w]
+        b = b[:h, :w]
+    # apply Hann window
+    hann = cv2.createHanningWindow((a.shape[1], a.shape[0]), cv2.CV_32F)
+    a_w = a * hann
+    b_w = b * hann
+    (shift, response) = cv2.phaseCorrelate(a_w, b_w)
+    # shift returned as (dx, dy) in float
+    dx, dy = float(shift[0]), float(shift[1])
+    return {"dx": dx, "dy": dy, "response": float(response)}
+
+# ------------------ Core Profiling Functions ------------------
+
+def profile_single_folder(folder, sample_limit=None, hist_bins=256):
+    """
+    Profile a folder that contains images.
+    Returns per-file metadata and aggregated stats.
+    """
+    files = list_image_files(folder)
+    total = len(files)
+    if sample_limit is not None:
+        files = files[:sample_limit]
+    meta_list = []
+    histograms = []
+    dead_stats = []
+    sizes = Counter()
+    error_files = []
+    for f in files:
+        p = os.path.join(folder, f)
+        try:
+            meta = file_metadata(p)
+            meta_list.append(meta)
+            sizes[(meta["width"], meta["height"])] += 1
+            im = load_image(p, as_gray=False)
+            dead = dead_and_noise_metrics(im)
+            dead_stats.append(dead)
+            hist = histogram_for_image(im, bins=hist_bins)
+            histograms.append(hist)
+        except Exception as e:
+            error_files.append({"file": p, "error": str(e)})
+    # aggregate
+    if meta_list:
+        overall_min = min(m["min"] for m in meta_list)
+        overall_max = max(m["max"] for m in meta_list)
+        overall_mean = float(np.mean([m["mean"] for m in meta_list]))
+        overall_std = float(np.mean([m["std"] for m in meta_list]))
+        channels_set = sorted(set(m["channels"] for m in meta_list))
+        dtype_set = sorted(set(m["dtype"] for m in meta_list))
+        bit_set = sorted(set(str(m["bit_depth"]) for m in meta_list))
+    else:
+        overall_min = overall_max = overall_mean = overall_std = None
+        channels_set = dtype_set = bit_set = []
+    # percent broken
+    total_nan = sum(d["nan_count"] for d in dead_stats) if dead_stats else 0
+    total_dead = sum(d["dead_count"] for d in dead_stats) if dead_stats else 0
+    return {
+        "folder": folder,
+        "num_files_total": total,
+        "num_files_profiled": len(meta_list),
+        "sizes_counter": dict(sizes),
+        "channels": channels_set,
+        "dtypes": dtype_set,
+        "bit_depths": bit_set,
+        "overall_min": overall_min,
+        "overall_max": overall_max,
+        "overall_mean": overall_mean,
+        "overall_std": overall_std,
+        "total_nan": int(total_nan),
+        "total_dead": int(total_dead),
+        "sample_file_metadata": meta_list[:10],
+        "sample_histograms": histograms[:5],
+        "error_files": error_files
+    }
+
+def match_and_profile_pairs(root, view="img_left", sample_limit=None, hist_bins=256, compute_offset=True, offset_samples=50):
+    """
+    For matching rgb <-> thr in a particular view (img_left or img_right).
+    - finds common filenames in root/rgb/view and root/thr/view
+    - computes per-pair metadata and (optionally) alignment offsets for sample files
+    """
+    rgb_folder = os.path.join(root, "rgb", view)
+    thr_folder = os.path.join(root, "thr", view)
+    if not os.path.isdir(rgb_folder) or not os.path.isdir(thr_folder):
+        return {"error": f"Missing folders: {rgb_folder} or {thr_folder}"}
+    rgb_files = list_image_files(rgb_folder)
+    thr_files = list_image_files(thr_folder)
+    common = sorted(list(set(rgb_files).intersection(set(thr_files))))
+    common = sorted(common)
+    total_pairs = len(common)
+    if sample_limit is not None:
+        common = common[:sample_limit]
+    pair_meta = []
+    offsets = []
+    offset_count = 0
+    for i, fname in enumerate(common):
+        pr = {"name": fname}
+        p_rgb = os.path.join(rgb_folder, fname)
+        p_thr = os.path.join(thr_folder, fname)
+        try:
+            m_rgb = file_metadata(p_rgb)
+            m_thr = file_metadata(p_thr)
+            pr["rgb"] = m_rgb
+            pr["thr"] = m_thr
+            # check size match
+            same_size = (m_rgb["width"] == m_thr["width"] and m_rgb["height"] == m_thr["height"])
+            pr["size_match"] = same_size
+            # is likely LWIR?
+            pr["thr_lwir_candidate"] = is_lwir_candidate(m_thr)
+            # compute offset only for some samples to save time
+            if compute_offset and offset_count < offset_samples:
+                # load grayscale versions
+                im_rgb = load_image(p_rgb, as_gray=True).astype(np.float32)
+                im_thr = load_image(p_thr, as_gray=True).astype(np.float32)
+                off = phase_correlation_offset(im_rgb, im_thr)
+                pr["offset"] = off
+                offsets.append((off["dx"], off["dy"], off["response"]))
+                offset_count += 1
+        except Exception as e:
+            pr["error"] = str(e)
+        pair_meta.append(pr)
+    # summarize offsets
+    if offsets:
+        dxs = [o[0] for o in offsets]
+        dys = [o[1] for o in offsets]
+        responses = [o[2] for o in offsets]
+        offset_summary = {
+            "count": len(offsets),
+            "dx_mean": float(np.mean(dxs)),
+            "dy_mean": float(np.mean(dys)),
+            "dx_median": float(np.median(dxs)),
+            "dy_median": float(np.median(dys)),
+            "response_mean": float(np.mean(responses))
+        }
+    else:
+        offset_summary = None
+    return {
+        "rgb_folder": rgb_folder,
+        "thr_folder": thr_folder,
+        "total_pairs_found": total_pairs,
+        "pairs_profiled": len(pair_meta),
+        "pairs": pair_meta,
+        "offset_summary": offset_summary
+    }
+
+# ------------------ Top-level ------------------
+
+def profile_dataset_images(root_dir,
+                           modalities=("rgb", "thr"),
+                           views=("img_left", "img_right"),
+                           sample_limit=None,
+                           compute_histograms=False,
+                           hist_bins=256,
+                           compute_pair_offsets=True,
+                           offset_samples=50):
+    """
+    Master function to profile dataset structured as:
+    root_dir/
+        rgb/img_left/*.png
+        rgb/img_right/*.png
+        thr/img_left/*.png
+        thr/img_right/*.png
+
+    Returns a big report dictionary.
+    """
+    report = {"root": root_dir, "modalities": {}, "pairs": {}}
+    # profile each modality/view folder
+    for mod in modalities:
+        report["modalities"][mod] = {}
+        for view in views:
+            folder = os.path.join(root_dir, mod, view)
+            if not os.path.isdir(folder):
+                report["modalities"][mod][view] = {"error": "missing folder"}
+                continue
+            rep = profile_single_folder(folder, sample_limit=sample_limit, hist_bins=hist_bins)
+            # if compute_histograms is True, we keep small hist summaries (already in rep)
+            report["modalities"][mod][view] = rep
+
+    # Check structure / train/val/test (simple heuristic)
+    found_splits = {}
+    files_in_root = os.listdir(root_dir)
+    for s in ("train", "val", "test"):
+        found_splits[s] = s in files_in_root
+    report["splits"] = found_splits
+
+    # match rgb <-> thr for each view and compute offsets summary
+    if "rgb" in modalities and "thr" in modalities:
+        for view in views:
+            match = match_and_profile_pairs(root_dir, view=view, sample_limit=sample_limit,
+                                            hist_bins=hist_bins, compute_offset=compute_pair_offsets, offset_samples=offset_samples)
+            report["pairs"][view] = match
+
+    return report
+
+# ------------------ Output utils ------------------
+
+def print_report(report, top_files=5):
+    print("\n==================== DATASET PROFILE SUMMARY ====================\n")
+    print(f"Root: {report.get('root')}")
+    print("\n--- Modalities ---")
+    for mod, views in report["modalities"].items():
+        print(f"\nModality: {mod}")
+        for view, d in views.items():
+            if "error" in d:
+                print(f"  {view}: ERROR -> {d['error']}")
+                continue
+            print(f"  {view}: total_files={d['num_files_total']}, profiled={d['num_files_profiled']}")
+            sizes = d.get("sizes_counter", {})
+            print(f"    sizes: {sizes}")
+            print(f"    channels: {d.get('channels')}, dtypes: {d.get('dtypes')}, bit_depths: {d.get('bit_depths')}")
+            print(f"    overall_min/max: {d.get('overall_min'):.3f} / {d.get('overall_max'):.3f}" if d.get('overall_min') is not None else "    no data")
+            print(f"    overall_mean/std: {d.get('overall_mean'):.3f} / {d.get('overall_std'):.3f}" if d.get('overall_mean') is not None else "")
+            print(f"    total_nan: {d.get('total_nan')}, total_dead: {d.get('total_dead')}")
+            if d.get('error_files'):
+                print(f"    error_files_count: {len(d.get('error_files'))}")
+    print("\n--- Pairs (rgb <-> thr) ---")
+    for view, p in report.get("pairs", {}).items():
+        if "error" in p:
+            print(f"  {view}: ERROR -> {p['error']}")
+            continue
+        print(f"  View: {view}: total_pairs_found={p['total_pairs_found']}, pairs_profiled={p['pairs_profiled']}")
+        if p.get("offset_summary"):
+            osum = p["offset_summary"]
+            print(f"    offset_summary: dx_mean={osum['dx_mean']:.3f}, dy_mean={osum['dy_mean']:.3f}, response_mean={osum['response_mean']:.4f}")
+        else:
+            print("    No offsets computed.")
+    print("\n=================================================================\n")
+
+def save_report_json(report, outpath):
+    with open(outpath, "w", encoding="utf8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+    print(f"Saved report to {outpath}")
+
+# ------------------ Example usage ------------------
+if __name__ == "__main__":
+    root = "_2021-08-13-16-08-46"
+    rpt = profile_dataset_images(root,
+                                modalities=("rgb","thr"),
+                                views=("img_left","img_right"),
+                                sample_limit=500,
+                                compute_histograms=True,
+                                hist_bins=256,
+                                compute_pair_offsets=True,
+                                offset_samples=50)
+    print_report(rpt)
+    save_report_json(rpt, "profile_report.json")
