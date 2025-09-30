@@ -380,10 +380,20 @@ def print_report(report, top_files=5):
             print("    No offsets computed.")
     print("\n=================================================================\n")
 
+def make_json_safe(obj):
+    if isinstance(obj, dict):
+        return {str(k): make_json_safe(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [make_json_safe(x) for x in obj]
+    else:
+        return obj
+
 def save_report_json(report, outpath):
+    safe_report = make_json_safe(report)
     with open(outpath, "w", encoding="utf8") as f:
-        json.dump(report, f, indent=2, ensure_ascii=False)
+        json.dump(safe_report, f, indent=2, ensure_ascii=False)
     print(f"Saved report to {outpath}")
+
 
 # ------------------ Example usage ------------------
 if __name__ == "__main__":
