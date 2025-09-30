@@ -3,57 +3,36 @@ import cv2
 import numpy as np
 from glob import glob
 from tqdm import tqdm
-import torch
-from torch.utils.data import Dataset
-from torchvision import transforms
+import random
 
 # ================= CONFIG ================= #
-# انتخاب اینکه کدوم بخش‌ها استفاده بشن
 USE_LEFT = True
 USE_RIGHT = True
-
-# قید کردن کامل یک بخش
 SKIP_LEFT = False
 SKIP_RIGHT = False
-
-# اگر نیاز به registration داره => کل بخش رو حذف کنیم
 REG_LEFT = False
 REG_RIGHT = False
-
-# اگر augmentation لازم باشه
 AUG_LEFT = True
 AUG_RIGHT = False
-
-# اندازه نهایی تصاویر
 FINAL_SIZE = (256, 256)
-
-# فیلتر مدین (فقط برای RGB)
 APPLY_MEDIAN = True
 MEDIAN_KSIZE = 3
-
-# مسیر دیتاست ورودی و خروجی
-INPUT_ROOT = "dataset_root"
-OUTPUT_ROOT = "processed_dataset"
-
+INPUT_ROOT = "_2021-08-06-16-19-00"
+OUTPUT_ROOT = "processed_dataset_aug"
 # ========================================== #
 
 def ensure_dir(path):
     if not os.path.exists(path):
         os.makedirs(path)
 
-
 def normalize_rgb(img):
-    """ Normalize RGB image to [-1,1] """
     img = img.astype(np.float32) / 127.5 - 1.0
     return img
 
-
 def normalize_thr(img):
-    """ Normalize Thermal (uint16) to [0,1] """
     img = img.astype(np.float32)
     img = (img - img.min()) / (img.max() - img.min() + 1e-8)
     return img
-
 
 def preprocess_and_save(img_path, out_path, is_rgb=True):
     img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
@@ -65,41 +44,63 @@ def preprocess_and_save(img_path, out_path, is_rgb=True):
     # Resize
     img = cv2.resize(img, FINAL_SIZE, interpolation=cv2.INTER_AREA)
 
-    # Normalize
-    if is_rgb:
-        img = normalize_rgb(img)
-    else:
-        img = normalize_thr(img)
-
-    # Convert back to uint8 for saving PNG
-    if is_rgb:
-        img_out = ((img + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
-    else:
-        img_out = (img * 255.0).clip(0, 255).astype(np.uint8)
+    img_out = img.astype(np.uint8)
 
     ensure_dir(os.path.dirname(out_path))
     cv2.imwrite(out_path, img_out)
 
 
-def augment_and_save(img_path, out_path, is_rgb=True):
-    """ Simple augmentations saved to disk """
+# ============ Augmentation ============ #
+def augment_and_save(img_path, out_path, is_rgb=True, num_aug=5):
+    """Advanced augmentations saved to disk"""
     img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+    h, w = img.shape[:2]
 
-    aug_transforms = {
-        "_flip": lambda x: cv2.flip(x, 1),
-        "_rot90": lambda x: cv2.rotate(x, cv2.ROTATE_90_CLOCKWISE),
-    }
+    for i in range(num_aug):
+        aug_img = img.copy()
 
-    for suffix, func in aug_transforms.items():
-        aug_img = func(img)
-        aug_out_path = out_path.replace(".png", f"{suffix}.png")
+        # 1. Random rotation ±5°~15°
+        angle = random.uniform(-15, 15)
+        M = cv2.getRotationMatrix2D((w//2, h//2), angle, 1.0)
+        aug_img = cv2.warpAffine(aug_img, M, (w,h), borderMode=cv2.BORDER_REFLECT)
+
+        # 2. Random translation ±10%
+        tx = random.uniform(-0.1*w, 0.1*w)
+        ty = random.uniform(-0.1*h, 0.1*h)
+        M = np.float32([[1,0,tx],[0,1,ty]])
+        aug_img = cv2.warpAffine(aug_img, M, (w,h), borderMode=cv2.BORDER_REFLECT)
+
+        # 3. Random scaling 0.9~1.1
+        scale = random.uniform(0.9, 1.1)
+        aug_img = cv2.resize(aug_img, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+        # Center crop/pad to FINAL_SIZE
+        ch, cw = aug_img.shape[:2]
+        pad_h = max(0, FINAL_SIZE[1]-ch)
+        pad_w = max(0, FINAL_SIZE[0]-cw)
+        aug_img = cv2.copyMakeBorder(aug_img, pad_h//2, pad_h-pad_h//2,
+                                     pad_w//2, pad_w-pad_w//2, cv2.BORDER_REFLECT)
+        aug_img = cv2.resize(aug_img, FINAL_SIZE, interpolation=cv2.INTER_AREA)
+
+        # 4. Brightness/contrast adjustment (RGB only)
+        if is_rgb:
+            alpha = random.uniform(0.8, 1.2)  # contrast
+            beta = random.uniform(-20, 20)    # brightness
+            aug_img = cv2.convertScaleAbs(aug_img, alpha=alpha, beta=beta)
+
+        # 5. Gaussian noise (Thermal only)
+        if not is_rgb:
+            noise = np.random.normal(0, 10, aug_img.shape).astype(np.float32)
+            aug_img = np.clip(aug_img + noise, 0, 65535 if aug_img.dtype==np.uint16 else 255).astype(aug_img.dtype)
+
+        # Save
+        aug_out_path = out_path.replace(".png", f"_aug{i}.png")
+        ensure_dir(os.path.dirname(aug_out_path))
         cv2.imwrite(aug_out_path, aug_img)
 
-
+# ============ Dataset Processing ============ #
 def process_dataset():
     for modality in ["rgb", "thr"]:
         for side in ["img_left", "img_right"]:
-            # Skip / Reg check
             if side == "img_left":
                 if SKIP_LEFT or REG_LEFT:
                     continue
@@ -120,47 +121,10 @@ def process_dataset():
                 fname = os.path.basename(img_path)
                 out_path = os.path.join(output_dir, fname)
 
-                preprocess_and_save(img_path, out_path, is_rgb=(modality == "rgb"))
+                preprocess_and_save(img_path, out_path, is_rgb=(modality=="rgb"))
 
                 if do_aug:
-                    augment_and_save(out_path, out_path, is_rgb=(modality == "rgb"))
-
-
-# ============ PyTorch Dataset ============ #
-class RGBThermalDataset(Dataset):
-    def __init__(self, root=OUTPUT_ROOT, side="img_left", transform=None):
-        self.rgb_dir = os.path.join(root, "rgb", side)
-        self.thr_dir = os.path.join(root, "thr", side)
-        self.files = sorted(glob(os.path.join(self.rgb_dir, "*.png")))
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.files)
-
-    def __getitem__(self, idx):
-        rgb_path = self.files[idx]
-        fname = os.path.basename(rgb_path)
-        thr_path = os.path.join(self.thr_dir, fname)
-
-        rgb = cv2.imread(rgb_path, cv2.IMREAD_COLOR)
-        thr = cv2.imread(thr_path, cv2.IMREAD_GRAYSCALE)
-
-        # convert to tensor
-        rgb = torch.from_numpy(rgb.transpose(2,0,1)).float() / 127.5 - 1.0
-        thr = torch.from_numpy(thr).unsqueeze(0).float() / 255.0
-
-        if self.transform:
-            rgb = self.transform(rgb)
-            thr = self.transform(thr)
-
-        return rgb, thr
-
+                    augment_and_save(out_path, out_path, is_rgb=(modality=="rgb"), num_aug=5)
 
 if __name__ == "__main__":
     process_dataset()
-
-    # نمونه استفاده از Dataset
-    dataset = RGBThermalDataset(side="img_left")
-    print("Total samples:", len(dataset))
-    rgb, thr = dataset[0]
-    print("RGB shape:", rgb.shape, "THR shape:", thr.shape)
