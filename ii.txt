@@ -1,0 +1,166 @@
+import os
+import cv2
+import numpy as np
+from glob import glob
+from tqdm import tqdm
+import torch
+from torch.utils.data import Dataset
+from torchvision import transforms
+
+# ================= CONFIG ================= #
+# انتخاب اینکه کدوم بخش‌ها استفاده بشن
+USE_LEFT = True
+USE_RIGHT = True
+
+# قید کردن کامل یک بخش
+SKIP_LEFT = False
+SKIP_RIGHT = False
+
+# اگر نیاز به registration داره => کل بخش رو حذف کنیم
+REG_LEFT = False
+REG_RIGHT = False
+
+# اگر augmentation لازم باشه
+AUG_LEFT = True
+AUG_RIGHT = False
+
+# اندازه نهایی تصاویر
+FINAL_SIZE = (256, 256)
+
+# فیلتر مدین (فقط برای RGB)
+APPLY_MEDIAN = True
+MEDIAN_KSIZE = 3
+
+# مسیر دیتاست ورودی و خروجی
+INPUT_ROOT = "dataset_root"
+OUTPUT_ROOT = "processed_dataset"
+
+# ========================================== #
+
+def ensure_dir(path):
+    if not os.path.exists(path):
+        os.makedirs(path)
+
+
+def normalize_rgb(img):
+    """ Normalize RGB image to [-1,1] """
+    img = img.astype(np.float32) / 127.5 - 1.0
+    return img
+
+
+def normalize_thr(img):
+    """ Normalize Thermal (uint16) to [0,1] """
+    img = img.astype(np.float32)
+    img = (img - img.min()) / (img.max() - img.min() + 1e-8)
+    return img
+
+
+def preprocess_and_save(img_path, out_path, is_rgb=True):
+    img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+
+    # Median filter only for RGB
+    if is_rgb and APPLY_MEDIAN:
+        img = cv2.medianBlur(img, MEDIAN_KSIZE)
+
+    # Resize
+    img = cv2.resize(img, FINAL_SIZE, interpolation=cv2.INTER_AREA)
+
+    # Normalize
+    if is_rgb:
+        img = normalize_rgb(img)
+    else:
+        img = normalize_thr(img)
+
+    # Convert back to uint8 for saving PNG
+    if is_rgb:
+        img_out = ((img + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
+    else:
+        img_out = (img * 255.0).clip(0, 255).astype(np.uint8)
+
+    ensure_dir(os.path.dirname(out_path))
+    cv2.imwrite(out_path, img_out)
+
+
+def augment_and_save(img_path, out_path, is_rgb=True):
+    """ Simple augmentations saved to disk """
+    img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+
+    aug_transforms = {
+        "_flip": lambda x: cv2.flip(x, 1),
+        "_rot90": lambda x: cv2.rotate(x, cv2.ROTATE_90_CLOCKWISE),
+    }
+
+    for suffix, func in aug_transforms.items():
+        aug_img = func(img)
+        aug_out_path = out_path.replace(".png", f"{suffix}.png")
+        cv2.imwrite(aug_out_path, aug_img)
+
+
+def process_dataset():
+    for modality in ["rgb", "thr"]:
+        for side in ["img_left", "img_right"]:
+            # Skip / Reg check
+            if side == "img_left":
+                if SKIP_LEFT or REG_LEFT:
+                    continue
+                do_aug = AUG_LEFT
+            else:
+                if SKIP_RIGHT or REG_RIGHT:
+                    continue
+                do_aug = AUG_RIGHT
+
+            input_dir = os.path.join(INPUT_ROOT, modality, side)
+            output_dir = os.path.join(OUTPUT_ROOT, modality, side)
+            ensure_dir(output_dir)
+
+            img_files = sorted(glob(os.path.join(input_dir, "*.png")))
+
+            print(f"Processing {modality}/{side}: {len(img_files)} files")
+            for img_path in tqdm(img_files):
+                fname = os.path.basename(img_path)
+                out_path = os.path.join(output_dir, fname)
+
+                preprocess_and_save(img_path, out_path, is_rgb=(modality == "rgb"))
+
+                if do_aug:
+                    augment_and_save(out_path, out_path, is_rgb=(modality == "rgb"))
+
+
+# ============ PyTorch Dataset ============ #
+class RGBThermalDataset(Dataset):
+    def __init__(self, root=OUTPUT_ROOT, side="img_left", transform=None):
+        self.rgb_dir = os.path.join(root, "rgb", side)
+        self.thr_dir = os.path.join(root, "thr", side)
+        self.files = sorted(glob(os.path.join(self.rgb_dir, "*.png")))
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        rgb_path = self.files[idx]
+        fname = os.path.basename(rgb_path)
+        thr_path = os.path.join(self.thr_dir, fname)
+
+        rgb = cv2.imread(rgb_path, cv2.IMREAD_COLOR)
+        thr = cv2.imread(thr_path, cv2.IMREAD_GRAYSCALE)
+
+        # convert to tensor
+        rgb = torch.from_numpy(rgb.transpose(2,0,1)).float() / 127.5 - 1.0
+        thr = torch.from_numpy(thr).unsqueeze(0).float() / 255.0
+
+        if self.transform:
+            rgb = self.transform(rgb)
+            thr = self.transform(thr)
+
+        return rgb, thr
+
+
+if __name__ == "__main__":
+    process_dataset()
+
+    # نمونه استفاده از Dataset
+    dataset = RGBThermalDataset(side="img_left")
+    print("Total samples:", len(dataset))
+    rgb, thr = dataset[0]
+    print("RGB shape:", rgb.shape, "THR shape:", thr.shape)
