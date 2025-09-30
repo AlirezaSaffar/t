@@ -13,12 +13,12 @@ SKIP_RIGHT = False
 REG_LEFT = False
 REG_RIGHT = False
 AUG_LEFT = True
-AUG_RIGHT = False
+AUG_RIGHT = True
 FINAL_SIZE = (256, 256)
-APPLY_MEDIAN = True
+APPLY_MEDIAN = False
 MEDIAN_KSIZE = 3
 INPUT_ROOT = "_2021-08-06-16-19-00"
-OUTPUT_ROOT = "processed_dataset_aug"
+OUTPUT_ROOT = "processed_dataset"
 # ========================================== #
 
 def ensure_dir(path):
