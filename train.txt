@@ -1,0 +1,338 @@
+# finetune_unet.py
+# Usage: python finetune_unet.py
+# Put this file next to best_model.pth and your processed_dataset directory.
+
+import os
+import random
+from glob import glob
+from PIL import Image
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as T
+
+# ---------------- Config ---------------- #
+DATA_ROOT = "processed_dataset"
+MODEL_PATH = "best_model.pth"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # should be RTX 3090
+BATCH_SIZE = 8
+NUM_WORKERS = 4
+LR = 1e-4
+WEIGHT_DECAY = 1e-5
+EPOCHS = 10
+SAVE_DIR = "finetune_checkpoints"
+PRINT_EVERY = 50
+SEED = 42
+# ---------------------------------------- #
+
+torch.manual_seed(SEED)
+random.seed(SEED)
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+
+# ---------------- Model (from your UI code) ---------------- #
+class UnetSkipConnectionBlock(nn.Module):
+    def __init__(self, outer_nc, inner_nc, input_nc=None, submodule=None, outermost=False, innermost=False, norm="batch", upsample="bilinear", use_tanh=True):
+        super().__init__()
+        self.outermost = outermost
+        use_bias = norm == "instance"
+        if input_nc is None:
+            input_nc = outer_nc
+        downconv = nn.Conv2d(input_nc, inner_nc, 4, 2, 1, bias=use_bias)
+        downrelu = nn.LeakyReLU(0.2, True)
+        uprelu = nn.ReLU(True)
+        if norm == "batch":
+            downnorm = nn.BatchNorm2d(inner_nc)
+            upnorm = nn.BatchNorm2d(outer_nc)
+        elif norm == "instance":
+            downnorm = nn.InstanceNorm2d(inner_nc)
+            upnorm = nn.InstanceNorm2d(outer_nc)
+        else:
+            raise NotImplementedError()
+        if outermost:
+            if upsample == "convtrans":
+                upconv = nn.ConvTranspose2d(inner_nc * 2, outer_nc, 4, 2, 1)
+            else:
+                upconv = nn.Sequential(nn.UpsamplingBilinear2d(scale_factor=2), nn.Conv2d(inner_nc * 2, outer_nc, 5, padding=2))
+            down = [downconv]
+            up = [uprelu, upconv, nn.Tanh()] if use_tanh else [uprelu, upconv]
+            model = down + [submodule] + up
+        elif innermost:
+            if upsample == "convtrans":
+                upconv = nn.ConvTranspose2d(inner_nc, outer_nc, 4, 2, 1, bias=use_bias)
+            else:
+                upconv = nn.Sequential(nn.UpsamplingBilinear2d(scale_factor=2), nn.Conv2d(inner_nc, outer_nc, 5, padding=2, bias=use_bias))
+            down = [downrelu, downconv]
+            up = [uprelu, upconv, upnorm]
+            model = down + up
+        else:
+            if upsample == "convtrans":
+                upconv = nn.ConvTranspose2d(inner_nc * 2, outer_nc, 4, 2, 1, bias=use_bias)
+            else:
+                upconv = nn.Sequential(nn.UpsamplingBilinear2d(scale_factor=2), nn.Conv2d(inner_nc * 2, outer_nc, 5, padding=2, bias=use_bias))
+            down = [downrelu, downconv, downnorm]
+            up = [uprelu, upconv, upnorm]
+            model = down + [submodule] + up
+        self.model = nn.Sequential(*model)
+
+    def forward(self, x):
+        if self.outermost:
+            return self.model(x)
+        return torch.cat([x, self.model(x)], 1)
+
+
+class UnetGenerator(nn.Module):
+    def __init__(self, input_nc, output_nc, num_downs, ngf=64, norm="batch", upsample="bilinear", use_tanh=True):
+        super().__init__()
+        unet_block = UnetSkipConnectionBlock(ngf * 8, ngf * 8, submodule=None, norm=norm, innermost=True, upsample=upsample)
+        for _ in range(num_downs - 5):
+            unet_block = UnetSkipConnectionBlock(ngf * 8, ngf * 8, submodule=unet_block, norm=norm, upsample=upsample)
+        unet_block = UnetSkipConnectionBlock(ngf * 4, ngf * 8, submodule=unet_block, norm=norm, upsample=upsample)
+        unet_block = UnetSkipConnectionBlock(ngf * 2, ngf * 4, submodule=unet_block, norm=norm, upsample=upsample)
+        unet_block = UnetSkipConnectionBlock(ngf, ngf * 2, submodule=unet_block, norm=norm, upsample=upsample)
+        self.model = UnetSkipConnectionBlock(output_nc, ngf, input_nc=input_nc, submodule=unet_block, outermost=True, norm=norm, upsample=upsample, use_tanh=use_tanh)
+
+    def forward(self, x):
+        return self.model(x)
+# ----------------------------------------------------------- #
+
+
+# ---------------- Dataset ---------------- #
+class RGBThrDataset(Dataset):
+    """
+    Reads processed_dataset/rgb/{img_left,img_right} and processed_dataset/thr/{img_left,img_right}.
+    Each sample is (rgb_tensor, thr_tensor).
+    Normalization:
+      - RGB -> [-1, 1]
+      - Thr -> [0, 1]
+    """
+    def __init__(self, root=DATA_ROOT, split="train", transform_size=256):
+        super().__init__()
+        self.root = root
+        self.rgb_dirs = [
+            os.path.join(root, "rgb", "img_left"),
+            os.path.join(root, "rgb", "img_right"),
+        ]
+        self.thr_dirs = [
+            os.path.join(root, "thr", "img_left"),
+            os.path.join(root, "thr", "img_right"),
+        ]
+
+        # Collect rgb file paths and ensure corresponding thr exists
+        self.pairs = []
+        for rgb_dir, thr_dir in zip(self.rgb_dirs, self.thr_dirs):
+            if not os.path.isdir(rgb_dir) or not os.path.isdir(thr_dir):
+                continue
+            rgb_files = sorted(glob(os.path.join(rgb_dir, "*.png")))
+            for rpath in rgb_files:
+                fname = os.path.basename(rpath)
+                tpath = os.path.join(thr_dir, fname)
+                if os.path.exists(tpath):
+                    self.pairs.append((rpath, tpath))
+                else:
+                    # skip if no matching thermal file
+                    continue
+
+        if len(self.pairs) == 0:
+            raise RuntimeError(f"No pairs found under {root}. Check structure.")
+
+        # transforms
+        self.rgb_transform = T.Compose([
+            T.Resize((transform_size, transform_size)),
+            T.ToTensor(),                 # [0,1]
+            T.Normalize(mean=[0.5,0.5,0.5], std=[0.5,0.5,0.5])  # -> [-1,1]
+        ])
+        # For thr, keep single channel, map to [0,1]
+        self.thr_transform = T.Compose([
+            T.Resize((transform_size, transform_size)),
+            T.ToTensor(),  # will be 1 x H x W, values in [0,1]
+        ])
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, idx):
+        rpath, tpath = self.pairs[idx]
+        rgb = Image.open(rpath).convert("RGB")
+        thr = Image.open(tpath).convert("L")  # single channel thermal
+
+        rgb_t = self.rgb_transform(rgb)    # 3 x H x W, in [-1,1]
+        thr_t = self.thr_transform(thr)    # 1 x H x W, in [0,1]
+
+        return rgb_t, thr_t
+
+
+# ---------------- Utilities to load checkpoint and unfreeze selected parts ---------------- #
+def load_checkpoint_model(path, device):
+    ckpt = torch.load(path, map_location=device)
+    netG = UnetGenerator(3, 1, 8, norm='batch', upsample='bilinear', use_tanh=True)
+    netG = torch.nn.DataParallel(netG)
+    # Expecting same key as in original checkpoint
+    if 'model_netG_state_dict' in ckpt:
+        netG.load_state_dict(ckpt['model_netG_state_dict'])
+    else:
+        # fallback: try loading whole state dict
+        try:
+            netG.load_state_dict(ckpt)
+        except Exception as e:
+            raise RuntimeError("Checkpoint format not recognized: " + str(e))
+    netG.to(device)
+    return netG
+
+
+def freeze_all_params(model):
+    for p in model.parameters():
+        p.requires_grad = False
+
+
+def find_unetskip_blocks(module, path=""):
+    """
+    Recursively find all UnetSkipConnectionBlock instances, return list of tuples (module, depth, path)
+    Depth definition: how deep the recursion goes (larger = deeper).
+    """
+    blocks = []
+    def recurse(m, current_depth, current_path):
+        if isinstance(m, UnetSkipConnectionBlock):
+            blocks.append((m, current_depth, current_path))
+        # search children
+        for name, child in m.named_children():
+            recurse(child, current_depth + 1, current_path + ("/" + name))
+    recurse(module, 0, path)
+    return blocks
+
+
+def unfreeze_decoder_and_last_encoder(model):
+    """
+    Strategy:
+      - Unfreeze parameters that look like decoder (upsampling layers):
+          types: nn.ConvTranspose2d, nn.UpsamplingBilinear2d, nn.Conv2d that are part of up blocks
+      - Also detect deepest UnetSkipConnectionBlock (encoder's deepest block) and unfreeze all its params.
+    This is a heuristic but matches the Unet structure you provided.
+    """
+    # If DataParallel, get module
+    core = model.module if isinstance(model, nn.DataParallel) else model
+
+    # Freeze everything first (safety)
+    freeze_all_params(core)
+
+    # 1) find deepest UnetSkipConnectionBlock and unfreeze it
+    blocks = find_unetskip_blocks(core)
+    if len(blocks) > 0:
+        # pick block with max depth
+        deepest = max(blocks, key=lambda x: x[1])
+        deepest_module = deepest[0]
+        for p in deepest_module.parameters():
+            p.requires_grad = True
+        print(f"[INFO] Unfroze deepest UnetSkipConnectionBlock at path {deepest[2]} depth={deepest[1]}")
+    else:
+        print("[WARN] No UnetSkipConnectionBlock found to unfreeze (unexpected).")
+
+    # 2) unfreeze decoder-ish modules: detect modules that are ConvTranspose2d or Upsampling sequences
+    unfreeze_cnt = 0
+    for name, m in core.named_modules():
+        # If it's a transpose conv (typical decoder upconv)
+        if isinstance(m, (nn.ConvTranspose2d, nn.UpsamplingBilinear2d)):
+            for p in m.parameters():
+                p.requires_grad = True
+            unfreeze_cnt += 1
+        # also consider Conv2d that likely belong to up path when their number of in/out channels fit pattern
+        # We'll unfreeze conv2d modules that appear after upsampling in module name (heuristic)
+        if isinstance(m, nn.Conv2d) and ("model" in name and ("upsample" in name or "upconv" in name or "up" in name or "outer" in name)):
+            for p in m.parameters():
+                p.requires_grad = True
+            unfreeze_cnt += 1
+
+    # Additionally, unfreeze BatchNorm/InstanceNorm layers that belong to up path (so training is stable)
+    for name, m in core.named_modules():
+        if isinstance(m, (nn.BatchNorm2d, nn.InstanceNorm2d)):
+            # heuristic: if name contains 'model' and appears in later parts
+            if "model" in name:
+                for p in m.parameters():
+                    p.requires_grad = True
+
+    print(f"[INFO] Unfroze ~{unfreeze_cnt} decoder-related modules (heuristic).")
+    # report trainable param count
+    trainable = sum(p.numel() for p in core.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in core.parameters())
+    print(f"[INFO] Trainable params after selection: {trainable}/{total} ({100*trainable/total:.3f}%)")
+
+
+# ---------------- Training loop ---------------- #
+def train():
+    # dataset & dataloader
+    ds = RGBThrDataset(root=DATA_ROOT, transform_size=256)
+    loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
+
+    # load model
+    model = load_checkpoint_model(MODEL_PATH, DEVICE)
+    print("[INFO] Model loaded to device:", DEVICE)
+
+    # freeze & unfreeze selected parts
+    unfreeze_decoder_and_last_encoder(model)
+
+    # define optimizer (only params with requires_grad=True)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if len(trainable_params) == 0:
+        raise RuntimeError("No trainable parameters found after unfreezing. Check unfreeze logic.")
+    optimizer = optim.Adam(trainable_params, lr=LR, weight_decay=WEIGHT_DECAY)
+
+    # loss (MSE between predicted thermal (after tanh->mapped) and ground truth [0,1])
+    criterion = nn.MSELoss()
+
+    # optionally scheduler
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+
+    model.train()
+    for epoch in range(1, EPOCHS + 1):
+        running_loss = 0.0
+        pbar = tqdm(enumerate(loader), total=len(loader), desc=f"Epoch {epoch}/{EPOCHS}")
+        for i, (rgb, thr) in pbar:
+            rgb = rgb.to(DEVICE, non_blocking=True)
+            thr = thr.to(DEVICE, non_blocking=True)
+
+            optimizer.zero_grad()
+
+            with torch.set_grad_enabled(True):
+                out = model(rgb)  # model outputs tanh if use_tanh True -> in [-1,1]; expected out shape [B,1,H,W]
+                # Map model output from [-1,1] -> [0,1]
+                out_mapped = (out + 1.0) / 2.0
+                out_mapped = torch.clamp(out_mapped, 0.0, 1.0)
+
+                loss = criterion(out_mapped, thr)
+                loss.backward()
+                optimizer.step()
+
+            running_loss += loss.item()
+            if (i + 1) % PRINT_EVERY == 0:
+                avg = running_loss / (i + 1)
+                pbar.set_postfix({'loss': f"{avg:.6f}"})
+
+        epoch_loss = running_loss / len(loader)
+        print(f"Epoch {epoch} finished. Avg Loss: {epoch_loss:.6f}")
+
+        # step scheduler
+        scheduler.step()
+
+        # save checkpoint every epoch
+        ckpt = {
+            'epoch': epoch,
+            'model_netG_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': epoch_loss
+        }
+        save_path = os.path.join(SAVE_DIR, f"finetuned_epoch{epoch:03d}.pth")
+        torch.save(ckpt, save_path)
+        print(f"[INFO] Saved checkpoint: {save_path}")
+
+    print("[INFO] Training complete.")
+    # final save
+    final_path = os.path.join(SAVE_DIR, "finetuned_final.pth")
+    torch.save({'model_netG_state_dict': model.state_dict()}, final_path)
+    print(f"[INFO] Final model saved: {final_path}")
+
+
+if __name__ == "__main__":
+    train()
