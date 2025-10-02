@@ -204,56 +204,43 @@ def find_unetskip_blocks(module, path=""):
     return blocks
 
 
-def unfreeze_decoder_and_last_encoder(model):
+def unfreeze_last_decoder_block(model):
     """
-    Strategy:
-      - Unfreeze parameters that look like decoder (upsampling layers):
-          types: nn.ConvTranspose2d, nn.UpsamplingBilinear2d, nn.Conv2d that are part of up blocks
-      - Also detect deepest UnetSkipConnectionBlock (encoder's deepest block) and unfreeze all its params.
-    This is a heuristic but matches the Unet structure you provided.
+    Only unfreeze the last decoder block (upsample layers) and the outermost UnetSkipConnectionBlock.
+    Everything else stays frozen.
     """
-    # If DataParallel, get module
     core = model.module if isinstance(model, nn.DataParallel) else model
 
-    # Freeze everything first (safety)
+    # Freeze all first
     freeze_all_params(core)
 
-    # 1) find deepest UnetSkipConnectionBlock and unfreeze it
+    # Find all UnetSkipConnectionBlock
     blocks = find_unetskip_blocks(core)
-    if len(blocks) > 0:
-        # pick block with max depth
-        deepest = max(blocks, key=lambda x: x[1])
-        deepest_module = deepest[0]
-        for p in deepest_module.parameters():
-            p.requires_grad = True
-        print(f"[INFO] Unfroze deepest UnetSkipConnectionBlock at path {deepest[2]} depth={deepest[1]}")
-    else:
-        print("[WARN] No UnetSkipConnectionBlock found to unfreeze (unexpected).")
+    if len(blocks) == 0:
+        print("[WARN] No UnetSkipConnectionBlock found.")
+        return
 
-    # 2) unfreeze decoder-ish modules: detect modules that are ConvTranspose2d or Upsampling sequences
+    # 1) Unfreeze outermost block (the first/outer block in UnetGenerator)
+    outermost_block = blocks[0][0]  # blocks are collected in order of recursion
+    for p in outermost_block.parameters():
+        p.requires_grad = True
+    print(f"[INFO] Unfroze outermost UnetSkipConnectionBlock at path {blocks[0][2]}")
+
+    # 2) Unfreeze last decoder-ish modules inside this block (heuristic)
+    # Typically these are nn.ConvTranspose2d and UpsamplingBilinear2d
     unfreeze_cnt = 0
-    for name, m in core.named_modules():
-        # If it's a transpose conv (typical decoder upconv)
+    for name, m in outermost_block.named_modules():
         if isinstance(m, (nn.ConvTranspose2d, nn.UpsamplingBilinear2d)):
             for p in m.parameters():
                 p.requires_grad = True
             unfreeze_cnt += 1
-        # also consider Conv2d that likely belong to up path when their number of in/out channels fit pattern
-        # We'll unfreeze conv2d modules that appear after upsampling in module name (heuristic)
-        if isinstance(m, nn.Conv2d) and ("model" in name and ("upsample" in name or "upconv" in name or "up" in name or "outer" in name)):
+        # optional: unfreeze BatchNorm/InstanceNorm in this block
+        if isinstance(m, (nn.BatchNorm2d, nn.InstanceNorm2d)):
             for p in m.parameters():
                 p.requires_grad = True
-            unfreeze_cnt += 1
 
-    # Additionally, unfreeze BatchNorm/InstanceNorm layers that belong to up path (so training is stable)
-    for name, m in core.named_modules():
-        if isinstance(m, (nn.BatchNorm2d, nn.InstanceNorm2d)):
-            # heuristic: if name contains 'model' and appears in later parts
-            if "model" in name:
-                for p in m.parameters():
-                    p.requires_grad = True
+    print(f"[INFO] Unfroze ~{unfreeze_cnt} decoder-related modules in outermost block")
 
-    print(f"[INFO] Unfroze ~{unfreeze_cnt} decoder-related modules (heuristic).")
     # report trainable param count
     trainable = sum(p.numel() for p in core.parameters() if p.requires_grad)
     total = sum(p.numel() for p in core.parameters())
