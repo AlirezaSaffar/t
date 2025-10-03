@@ -1,0 +1,22 @@
+def __getitem__(self, idx):
+    rpath, tpath = self.pairs[idx]
+
+    # --- RGB ---
+    rgb = Image.open(rpath).convert("RGB")
+    rgb_t = self.rgb_transform(rgb)    # 3 x H x W, در [-1,1]
+
+    # --- Thermal (uint16) ---
+    thr = Image.open(tpath)
+    thr = np.array(thr, dtype=np.float32)   # همون uint16 رو می‌خونه → float32
+
+    # نرمالایز به بازه [0,1] (طبق پروفایل داده‌ها)
+    thr = (thr - 3000.0) / (10000.0 - 3000.0)
+    thr = np.clip(thr, 0.0, 1.0)
+
+    # به Tensor
+    thr_t = torch.from_numpy(thr).unsqueeze(0)  # [1,H,W]
+
+    # Resize هم مثل RGB (اگر می‌خوای اندازه یکسان باشه)
+    thr_t = T.functional.resize(thr_t, (self.transform_size, self.transform_size))
+
+    return rgb_t, thr_t
