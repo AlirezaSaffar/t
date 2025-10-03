@@ -160,7 +160,14 @@ class RGBThrDataset(Dataset):
         thr = Image.open(tpath).convert("L")  # single channel thermal
 
         rgb_t = self.rgb_transform(rgb)    # 3 x H x W, in [-1,1]
-        thr_t = self.thr_transform(thr)    # 1 x H x W, in [0,1]
+
+        # ----- custom normalization for thermal ----- #
+        thr_np = np.array(thr, dtype=np.float32)
+        thr_min, thr_max = thr_np.min(), thr_np.max()
+        thr_norm = (thr_np - thr_min) / (thr_max - thr_min + 1e-8)  # -> [0,1]
+        thr = Image.fromarray((thr_norm * 255).astype(np.uint8))
+        thr_t = T.ToTensor()(thr)   # 1 x H x W, in [0,1]
+        thr_t = T.Resize((self.transform_size, self.transform_size))(thr_t)
 
         return rgb_t, thr_t
 
