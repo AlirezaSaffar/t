@@ -1,0 +1,161 @@
+import os
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as T
+from tqdm import tqdm
+from PIL import Image
+import numpy as np
+import tkinter as tk
+from tkinter import filedialog
+
+# ---------------- Test Dataset ---------------- #
+class RGBThrTestDataset(Dataset):
+    """
+    Reads test dataset (rgb and thr) and returns the (rgb_tensor, thr_tensor) pair.
+    Normalization:
+      - RGB -> [-1, 1]
+      - Thr -> [0, 1]
+    """
+    def __init__(self, root, transform_size=256):
+        super().__init__()
+        self.root = root
+        self.rgb_dirs = [
+            os.path.join(root, "rgb", "img_left"),
+            os.path.join(root, "rgb", "img_right"),
+        ]
+        self.thr_dirs = [
+            os.path.join(root, "thr", "img_left"),
+            os.path.join(root, "thr", "img_right"),
+        ]
+
+        # Collect rgb file paths and ensure corresponding thr exists
+        self.pairs = []
+        for rgb_dir, thr_dir in zip(self.rgb_dirs, self.thr_dirs):
+            if not os.path.isdir(rgb_dir) or not os.path.isdir(thr_dir):
+                continue
+            rgb_files = sorted(glob(os.path.join(rgb_dir, "*.png")))
+            for rpath in rgb_files:
+                fname = os.path.basename(rpath)
+                tpath = os.path.join(thr_dir, fname)
+                if os.path.exists(tpath):
+                    self.pairs.append((rpath, tpath))
+                else:
+                    # skip if no matching thermal file
+                    continue
+
+        if len(self.pairs) == 0:
+            raise RuntimeError(f"No pairs found under {root}. Check structure.")
+
+        # transforms
+        self.rgb_transform = T.Compose([
+            T.Resize((transform_size, transform_size)),
+            T.ToTensor(),                 # [0,1]
+            T.Normalize(mean=[0.5,0.5,0.5], std=[0.5,0.5,0.5])  # -> [-1,1]
+        ])
+        self.thr_transform = T.Compose([
+            T.Resize((transform_size, transform_size)),
+            T.ToTensor(),  # will be 1 x H x W, values in [0,1]
+        ])
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, idx):
+        rpath, tpath = self.pairs[idx]
+        rgb = Image.open(rpath).convert("RGB")
+        thr = Image.open(tpath).convert("L")  # single channel thermal
+
+        rgb_t = self.rgb_transform(rgb)    # 3 x H x W, in [-1,1]
+
+        # ----- custom normalization for thermal ----- #
+        thr_np = np.array(thr, dtype=np.float32)
+        thr_min, thr_max = thr_np.min(), thr_np.max()
+        thr_norm = (thr_np - thr_min) / (thr_max - thr_min + 1e-8)  # -> [0,1]
+        thr = Image.fromarray((thr_norm * 255).astype(np.uint8))
+        thr_t = T.ToTensor()(thr)   # 1 x H x W, in [0,1]
+        thr_t = T.Resize((self.transform_size, self.transform_size))(thr_t)
+
+        return rgb_t, thr_t
+
+
+# ---------------- Utilities to load checkpoint ---------------- #
+def load_checkpoint_model(path, device):
+    ckpt = torch.load(path, map_location=device)
+    netG = UnetGenerator(3, 1, 8, norm='batch', upsample='bilinear', use_tanh=True)
+    netG = torch.nn.DataParallel(netG)
+    if 'model_netG_state_dict' in ckpt:
+        netG.load_state_dict(ckpt['model_netG_state_dict'])
+    else:
+        try:
+            netG.load_state_dict(ckpt)
+        except Exception as e:
+            raise RuntimeError("Checkpoint format not recognized: " + str(e))
+    netG.to(device)
+    return netG
+
+
+# ---------------- Testing loop ---------------- #
+def test_model(model_path, test_data_dir, batch_size=8, device=torch.device("cuda" if torch.cuda.is_available() else "cpu")):
+    # Load model
+    model = load_checkpoint_model(model_path, device)
+    model.eval()
+    print(f"[INFO] Model loaded to device: {device}")
+
+    # Prepare dataset and dataloader
+    test_dataset = RGBThrTestDataset(root=test_data_dir, transform_size=256)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+
+    # Loss function
+    criterion = nn.MSELoss()
+
+    # Testing loop
+    total_loss = 0.0
+    with torch.no_grad():
+        pbar = tqdm(test_loader, desc="Testing", total=len(test_loader))
+        for rgb, thr in pbar:
+            rgb = rgb.to(device)
+            thr = thr.to(device)
+
+            # Forward pass
+            out = model(rgb)  # model outputs tanh if use_tanh True -> in [-1,1]
+            out_mapped = (out + 1.0) / 2.0  # Map from [-1,1] -> [0,1]
+            out_mapped = torch.clamp(out_mapped, 0.0, 1.0)
+
+            # Compute loss
+            loss = criterion(out_mapped, thr)
+            total_loss += loss.item()
+
+            pbar.set_postfix({'loss': f"{loss.item():.6f}"})
+
+    # Report final test loss
+    avg_loss = total_loss / len(test_loader)
+    print(f"Test finished. Avg Loss: {avg_loss:.6f}")
+
+
+# ---------------- File Dialogs ---------------- #
+def select_model_file():
+    root = tk.Tk()
+    root.withdraw()  # Hide the main window
+    file_path = filedialog.askopenfilename(title="Select a model file", filetypes=[("PTH files", "*.pth")])
+    return file_path
+
+def select_test_data_folder():
+    root = tk.Tk()
+    root.withdraw()  # Hide the main window
+    folder_path = filedialog.askdirectory(title="Select a test data folder")
+    return folder_path
+
+
+if __name__ == "__main__":
+    model_path = select_model_file()  # Prompt user to select the model file
+    if not model_path:
+        print("No model file selected, exiting.")
+        exit()
+
+    test_data_dir = select_test_data_folder()  # Prompt user to select the test data folder
+    if not test_data_dir:
+        print("No test data folder selected, exiting.")
+        exit()
+
+    test_model(model_path, test_data_dir)
